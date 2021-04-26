@@ -3,11 +3,13 @@ import torch.nn
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-plt.switch_backend('agg')
+plt.switch_backend('tkagg')
 import math
 import json
 import os
 from config import exp_name
+import cv2 as cv
+from copy import deepcopy
 
 def trasform_label2metric(label, ratio=4, grid_size=0.1, base_height=100):
     '''
@@ -70,6 +72,19 @@ def get_bev(velo_array, label_list = None, scores = None):
 
     return intensity
 
+def scan_to_image(scan):
+    '''Convert an input tensor into an image to be viewed or saved'''
+    scan = scan.permute(1, 2, 0)[:, :, :-1]
+    return cv.cvtColor(torch.amax(scan, dim=2, keepdim=True).cpu().numpy(), cv.COLOR_GRAY2BGR) * 255
+
+def label_map_to_image(label_map):
+    '''Convert a label_map tensor into an image to be viewed or saved'''
+    label_map = label_map.permute(1, 2, 0)
+    geometry = load_config()[0]['geometry']
+    image_truth = np.zeros((geometry['label_shape'][0], geometry['label_shape'][1], 3), dtype=np.uint8)
+    for p in torch.nonzero(label_map).cpu().numpy():
+        image_truth[np.int64(p[0]), np.int64(p[1])] = (255, 255, 255)
+    return image_truth
 
 def plot_bev(velo_array, label_list = None, scores = None, window_name='GT', save_path=None):
     '''
@@ -88,9 +103,8 @@ def plot_bev(velo_array, label_list = None, scores = None, window_name='GT', sav
     intensity = get_bev(velo_array, label_list, scores)
 
     if save_path != None:
-        print(save_path)
         cv2.imwrite(save_path, intensity)
-        cv2.waitKey(0)
+        # cv2.waitKey(0)
     else:
         cv2.imshow(window_name, intensity)
         cv2.waitKey(3)
@@ -255,37 +269,3 @@ def get_model_name(config, epoch=None):
 
     path = os.path.join(folder, str(epoch)+'epoch')
     return path
-
-def writefile(config, filename, value):
-    path = os.path.join('experiments', config['name'], filename)
-    with open(path, 'a') as f:
-        f.write(value)
-
-def printnorm(self, input, output):
-    # input is a tuple of packed inputs
-    # output is a Tensor. output.data is the Tensor we are interested
-    print('Inside ' + self.__class__.__name__ + ' forward')
-    print('')
-    print('input: ', type(input))
-    print('input[0]: ', type(input[0]))
-    print('output: ', type(output))
-    print('')
-    print('input size:', input[0].size())
-    print('output size:', output.data.size())
-    print('output norm:', output.data.norm())
-
-def printgradnorm(self, grad_input, grad_output):
-    print('Inside ' + self.__class__.__name__ + ' backward')
-    print('Inside class:' + self.__class__.__name__)
-    print('')
-    print('grad_input: ', type(grad_input))
-    print('grad_input[0]: ', type(grad_input[0]))
-    print('grad_output: ', type(grad_output))
-    print('grad_output[0]: ', type(grad_output[0]))
-    print('')
-    print('grad_input size:', grad_input[0].size())
-    print('grad_output size:', grad_output[0].size())
-    print('grad_input norm:', grad_input[0].norm())
-
-if __name__ == '__main__':
-    maskFOV_on_BEV(0)

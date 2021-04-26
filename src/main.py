@@ -1,4 +1,3 @@
-from math import isnan
 import torch
 import torch.nn as nn
 import numpy as np
@@ -10,23 +9,39 @@ from torch.multiprocessing import Pool
 from loss import PIXOR_Loss
 from datagen import get_data_loader
 from model import PIXOR
-from utils import get_model_name, load_config, plot_bev, plot_label_map, plot_pr_curve, get_bev
+# from old_model import PIXOR
+from utils import get_model_name, load_config, plot_bev, plot_label_map, plot_pr_curve, get_bev, scan_to_image, label_map_to_image
 from postprocess import filter_pred, compute_matches, compute_ap, post_process
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import os
 from config import base_dir
-from copy import deepcopy
+import torchvision
+import cv2 as cv
 
 
-def build_model(config, device, train=True):
+def build_model(device, train=True):
+    '''
+    Build the model, loss function, optimizer and scheduler
+
+    Parameters:
+        device (torch.device): device to run everything on
+        train (bool): whether to provide an optimizer and scheduler
+
+    Returns:
+        nn.Module: network
+        nn.Module: loss function
+        torch.optim: optimizer (if train = True)
+        torch.optim: scheduler (if train = True)
+    '''
+    config = load_config()[0]
+
+    # net = PIXOR(config['geometry'], config['use_bn'])
     net = PIXOR()
     loss_fn = PIXOR_Loss()
 
-    if torch.cuda.device_count() <= 1:
-        config['mGPUs'] = False
-    if config['mGPUs']:
-        print('using multi gpu')
+    if config['mGPUs'] and torch.cuda.device_count() >= 1:
+        print('Using Multi-GPU')
         net = nn.DataParallel(net)
 
     net = net.to(device)
@@ -34,8 +49,12 @@ def build_model(config, device, train=True):
     if not train:
         return net, loss_fn
 
-    optimizer = torch.optim.SGD(net.parameters(), lr=config['learning_rate'], momentum=config['momentum'], weight_decay=config['weight_decay'])
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=config['lr_decay_at'], gamma=0.1)
+    optimizer = torch.optim.SGD(
+        net.parameters(), lr=config['learning_rate'],
+        momentum=config['momentum'], weight_decay=config['weight_decay'])
+
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer, milestones=config['lr_decay_at'], gamma=0.1)
 
     return net, loss_fn, optimizer, scheduler
 
@@ -187,15 +206,15 @@ def validation_round(net, device, epoch_num, writer, writer_counter):
     # Load Hyperparameters
     config, _, batch_size, _ = load_config()
 
-    _, loss_fn, _, _ = build_model(config, device, train=False)
+    _, loss_fn = build_model(device, train=False)
 
     # Dataset and DataLoader
-    _, test_data_loader = get_data_loader(frame_range=config['frame_range'])
+    _, test_data_loader, _, num_test = get_data_loader(frame_range=config['frame_range'])
 
     with torch.no_grad():
         ave_loss = 0
 
-        with tqdm(total=len(test_data_loader), desc='Validation: ',
+        with tqdm(total=num_test, desc='Validation: ',
                 unit='pointclouds', leave=True, colour='green') as progress:
 
             for input, label_map, image_id in test_data_loader:
@@ -213,6 +232,18 @@ def validation_round(net, device, epoch_num, writer, writer_counter):
                     **{'loss': '{:.4f}'.format(abs(loss.item()))})
                 progress.update(config['batch_size'])
 
+                if progress.n % 50 == 0:
+                        _, label_list = test_data_loader.dataset.get_label(image_id[0])
+
+                        input_np = input[0].detach().cpu().permute(1, 2, 0).numpy()
+                        corners, _ = filter_pred(predictions[0].detach().cpu())
+
+                        plot_bev(input_np, label_list, window_name='GT',
+                                 save_path='/home/aaron/PIXOR/viz/train/test/epoch{}_{}.jpg'.format(writer_counter, epoch_num))
+                        plot_bev(input_np, corners, window_name='Prediction',
+                                 save_path='/home/aaron/PIXOR/viz/train/test/epoch{}_{}.jpg'.format(writer_counter, epoch_num))
+
+
                 # Add loss info to the Tensorboard logger
                 writer.add_scalars(
                     main_tag='testing',
@@ -223,7 +254,7 @@ def validation_round(net, device, epoch_num, writer, writer_counter):
                     }, global_step=writer_counter)
                 writer_counter += 1
 
-        ave_loss = ave_loss / len(test_data_loader)
+        ave_loss = ave_loss / num_test
 
         if epoch_num == 0:
             print('Initial Benchmark Validation Loss: {:.5f}\n'.format(
@@ -231,6 +262,7 @@ def validation_round(net, device, epoch_num, writer, writer_counter):
         else:
             print('Validation Loss After Epoch {}: {:.5f}\n'.format(
                 epoch_num, ave_loss))
+
         return ave_loss, writer_counter
 
 
@@ -238,15 +270,17 @@ def train(device):
     # Load Hyperparameters
     config, _, _, max_epochs = load_config()
 
-    # Dataset and DataLoader
     train_data_loader, _, num_train, _ = get_data_loader(frame_range=config['frame_range'])
 
-    # Model
-    net, loss_fn, optimizer, scheduler = build_model(config, device, train=True)
+    net, loss_fn, optimizer, scheduler = build_model(device, train=True)
 
     # Tensorboard Logger
     writer = SummaryWriter(log_dir=os.path.join(base_dir, 'log'))
     writer_counter = 0
+
+    # net.eval()
+    # images, _, _, _ = next(iter(train_data_loader))
+    # writer.add_graph(net, images.to(device))
 
     if config['resume_training']:
         saved_ckpt_path = get_model_name(config)
@@ -255,13 +289,11 @@ def train(device):
         else:
             net.load_state_dict(torch.load(saved_ckpt_path, map_location=device))
         print('Successfully loaded trained ckpt at {}'.format(saved_ckpt_path))
-        st_epoch = config['resume_from']
+        start_epoch = config['resume_from']
     else:
-        st_epoch = 0
+        start_epoch = 0
 
-    step = 1 + st_epoch * num_train
-
-    for epoch in range(st_epoch, max_epochs):        
+    for epoch in range(start_epoch, max_epochs):        
         epoch_loss = 0
 
         net.train()
@@ -293,19 +325,26 @@ def train(device):
                 progress.update(config['batch_size'])
 
                 with torch.no_grad():
-                    log_image = post_process(input[0], predictions.detach()[0])
+                    if progress.n % 50 == 0:
+                        _, label_list = train_data_loader.dataset.get_label(image_id[0])
 
-                # Add loss info to the Tensorboard logger
-                writer.add_scalars(
-                    main_tag='training',
-                    tag_scalar_dict={
-                        'loss': loss.item(),
-                        'cls_loss': cls,
-                        'loc_loss': loc,
-                    }, global_step=writer_counter)
-                writer_counter += 1
+                        input_np = input[0].detach().cpu().permute(1, 2, 0).numpy()
+                        corners, _ = filter_pred(predictions[0].detach().cpu())
 
-                step += 1
+                        plot_bev(input_np, label_list, window_name='GT',
+                                 save_path='/home/aaron/PIXOR/viz/train/truth/epoch{}_{}.jpg'.format(writer_counter, epoch))
+                        plot_bev(input_np, corners, window_name='Prediction',
+                                 save_path='/home/aaron/PIXOR/viz/train/output/epoch{}_{}.jpg'.format(writer_counter, epoch))
+
+                    # Add loss info to the Tensorboard logger
+                    writer.add_scalars(
+                        main_tag='training',
+                        tag_scalar_dict={
+                            'loss': loss.item(),
+                            'cls_loss': cls,
+                            'loc_loss': loc,
+                        }, global_step=writer_counter)
+                    writer_counter += 1
 
         # Record Training Loss
         epoch_loss = epoch_loss / len(train_data_loader)
@@ -349,7 +388,7 @@ def eval_one(net, loss_fn, config, loader, image_id, device, plot=False, verbose
 
     # Filter Predictions
     t_start = time.time()
-    corners, scores = filter_pred(config, pred)
+    corners, scores = filter_pred(pred)
     t_post = time.time() - t_start
 
     if verbose:
@@ -366,16 +405,16 @@ def eval_one(net, loss_fn, config, loader, image_id, device, plot=False, verbose
 
     if plot == True:
         # Visualization
-        plot_bev(input_np, label_list, window_name='GT')
-        plot_bev(input_np, corners, window_name='Prediction')
-        plot_label_map(cls_pred.numpy())
+        plot_bev(input_np, label_list, window_name='GT', save_path='/home/aaron/PIXOR/gt.jpg')
+        plot_bev(input_np, corners, window_name='Prediction', save_path='/home/aaron/PIXOR/pred.jpg')
+        plot_label_map(cls_pred.cpu().numpy())
 
     return num_gt, num_pred, scores, pred_image, pred_match, loss.item(), t_forward, t_post
 
 
 def experiment(device, eval_range='all', plot=True):
     config, _, _, _ = load_config()
-    net, loss_fn = build_model(config, device, train=False)
+    net, loss_fn = build_model(device, train=False)
     state_dict = torch.load(get_model_name(config), map_location=device)
     if config['mGPUs']:
         net.module.load_state_dict(state_dict)
@@ -404,10 +443,10 @@ def experiment(device, eval_range='all', plot=True):
 
 def test(device, image_id):
     config, _, _, _ = load_config()
-    net, loss_fn = build_model(config, device, train=False)
+    net, loss_fn = build_model(device, train=False)
     net.load_state_dict(torch.load(get_model_name(config), map_location=device))
     net.set_decode(True)
-    train_loader, val_loader = get_data_loader(frame_range=config['frame_range'])
+    train_loader, val_loader, _, _ = get_data_loader(frame_range=config['frame_range'])
     net.eval()
 
     with torch.no_grad():
@@ -421,8 +460,8 @@ def test(device, image_id):
         print('forward pass time {:.3f}s'.format(t_forward))
         print('nms time {:.3f}s'.format(t_nms))
 
-if __name__ == '__main__':
 
+if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PIXOR custom implementation')
     parser.add_argument('mode', choices=['train', 'val', 'test'], help='name of the experiment')
     parser.add_argument('--eval_range', type=int, help='range of evaluation')

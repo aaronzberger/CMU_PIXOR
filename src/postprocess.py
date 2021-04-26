@@ -9,6 +9,7 @@ from copy import deepcopy
 import numpy as np
 import torch
 from shapely.geometry import Polygon
+from torch._C import Value
 
 from utils import load_config, get_bev
 
@@ -120,6 +121,10 @@ def filter_pred(pred):
         return [], []
 
     corners = torch.zeros((num_boxes, 8))
+
+    # Indices 7:14 are the bounding boxes from the decoder
+    if pred.shape[0] != 15:
+        raise ValueError('Make sure decoder is running when trying to post-process')
     for i in range(7, 15):
         corners[:, i - 7] = torch.masked_select(pred[i, ...], activation)
     corners = corners.view(-1, 4, 2).numpy()

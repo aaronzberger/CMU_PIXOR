@@ -10,7 +10,7 @@ from utils import get_points_in_a_rotated_box, trasform_label2metric
 from torch.utils.data import Dataset, DataLoader
 import cv2 as cv
 from copy import deepcopy
-
+import sys
 
 class KITTI(Dataset):
     target_mean = np.array([0.008, 0.001, 0.202, 0.2, 0.43, 1.368])
@@ -38,25 +38,12 @@ class KITTI(Dataset):
         # Load and pre-process the point cloud
         scan = np.fromfile(self.velo[item], dtype=np.float32).reshape(-1, 4)
         scan = self.lidar_preprocess(scan)
-
-        # # Save an image of the point cloud
-        # image = cv.cvtColor(np.amax(deepcopy(scan), axis=2), cv.COLOR_GRAY2BGR) * 255
-        # cv.imwrite(os.path.join(base_dir, 'viz', 'pcl{}.jpg'.format(self.kitti_indices[item])), image)
-
         scan = torch.from_numpy(scan).permute(2, 0, 1)
 
         # Create the label_map from the KITTI label
-        label_map = self.get_label(item)
+        label_map, _ = self.get_label(item)
         self.reg_target_transform(label_map)
-        label_map = torch.from_numpy(label_map)
-
-        # Save an image of the ground truth label map
-        # image_truth = np.zeros((self.geometry['label_shape'][0], self.geometry['label_shape'][1], 3), dtype=np.uint8)
-        # for p in torch.nonzero(deepcopy(label_map)):
-        #     image_truth[np.int64(p[0]), np.int64(p[1])] = (255, 255, 255)
-        # cv.imwrite(os.path.join(base_dir, 'viz', 'labels{}.jpg'.format(self.kitti_indices[item])), image_truth)
-
-        label_map = label_map.permute(2, 0, 1)
+        label_map = torch.from_numpy(label_map).permute(2, 0, 1)
 
         return scan, label_map, item
 
@@ -156,6 +143,8 @@ class KITTI(Dataset):
         object_list = {'Car': 0} # Add more objects here if desired
         label_map = np.zeros(self.geometry['label_shape'], dtype=np.float32)
 
+        label_list = []
+
         with open(label_path, 'r') as f:
             lines = f.readlines() # get rid of \n symbol
             for line in lines:
@@ -172,8 +161,9 @@ class KITTI(Dataset):
 
                         # Fill the GT boxes in the label_map with white pixels
                         label_map = self.fill_boxes(label_map, corners, reg_target)
+                        label_list.append(corners)
 
-        return label_map
+        return label_map, label_list
 
     def load_velo(self, split):
         '''
